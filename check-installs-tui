@@ -1,0 +1,403 @@
+#!/bin/zsh
+
+emulate -L zsh
+setopt pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+MANAGER_W=12
+TYPE_W=10
+PACKAGE_W=34
+VERSION_W=16
+GRAPH_W=22
+
+human_size() {
+  local path=$1
+  [[ -e "$path" ]] || {
+    printf '%s' '-'
+    return 0
+  }
+  /usr/bin/du -sh "$path" 2>/dev/null | /usr/bin/awk '{print $1}'
+}
+
+trim_path() {
+  local path=$1
+  [[ -n "$path" ]] || {
+    printf '%s' '-'
+    return 0
+  }
+  printf '%s' "$path"
+}
+
+bar_for() {
+  local count=$1
+  local max=$2
+  local width=$3
+  local filled=0
+  (( max > 0 )) && filled=$(( count * width / max ))
+  (( filled < 1 && count > 0 )) && filled=1
+  printf '%*s' "$filled" '' | /usr/bin/tr ' ' '▇'
+}
+
+manager_color() {
+  case "$1" in
+    brew) printf '\033[38;5;81m' ;;
+    npm) printf '\033[38;5;214m' ;;
+    pnpm) printf '\033[38;5;220m' ;;
+    yarn) printf '\033[38;5;45m' ;;
+    bun) printf '\033[38;5;216m' ;;
+    pipx) printf '\033[38;5;141m' ;;
+    pip3) printf '\033[38;5;117m' ;;
+    gem) printf '\033[38;5;204m' ;;
+    cargo) printf '\033[38;5;173m' ;;
+    mas) printf '\033[38;5;150m' ;;
+    *) printf '\033[38;5;250m' ;;
+  esac
+}
+
+collect_brew() {
+  command -v brew >/dev/null 2>&1 || return 0
+  local cellar prefix name versions location size
+  cellar=$(brew --cellar 2>/dev/null)
+  prefix=$(brew --prefix 2>/dev/null)
+
+  brew list --versions 2>/dev/null | while read -r name versions; do
+    location="$cellar/$name"
+    size=$(human_size "$location")
+    printf 'brew\tformula\t%s\t%s\t%s\t%s\n' "$name" "${versions:--}" "$(trim_path "$location")" "$size"
+  done
+
+  brew list --cask --versions 2>/dev/null | while read -r name versions; do
+    location="$prefix/Caskroom/$name"
+    size=$(human_size "$location")
+    printf 'brew\tcask\t%s\t%s\t%s\t%s\n' "$name" "${versions:--}" "$(trim_path "$location")" "$size"
+  done
+}
+
+collect_npm_family() {
+  local pm=$1
+  local root output location size name version
+  command -v "$pm" >/dev/null 2>&1 || return 0
+
+  case "$pm" in
+    npm)
+      root=$(npm root -g 2>/dev/null)
+      output=$(npm -g ls --depth=0 2>/dev/null | /usr/bin/sed '1d' | /usr/bin/sed -E 's/^[[:space:]]*[├└]── //')
+      ;;
+    pnpm)
+      root=$(pnpm root -g 2>/dev/null)
+      output=$(pnpm ls -g --depth=0 2>/dev/null | /usr/bin/sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | /usr/bin/sed -n 's/^[[:space:]]*[├└]── //p')
+      ;;
+    yarn)
+      root="$(yarn global dir 2>/dev/null)/node_modules"
+      output=$(yarn global list --depth=0 2>/dev/null | /usr/bin/sed -n 's/^info "\(.*\)@\(.*\)$/\1@\2/p')
+      ;;
+    bun)
+      root="${BUN_INSTALL:-$HOME/.bun}/install/global/node_modules"
+      output=$(bun pm ls -g 2>/dev/null | /usr/bin/sed -n 's/^.* \([^ @][^@]*\)@\([^ ]*\).*$/\1@\2/p')
+      ;;
+  esac
+
+  printf '%s\n' "$output" | while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == @*/*@* ]]; then
+      version=${line##*@}
+      name=${line%@"$version"}
+    elif [[ "$line" == *@* ]]; then
+      version=${line##*@}
+      name=${line%@"$version"}
+    else
+      name=$line
+      version='-'
+    fi
+    location="$root/$name"
+    size=$(human_size "$location")
+    printf '%s\tglobal\t%s\t%s\t%s\t%s\n' "$pm" "$name" "$version" "$(trim_path "$location")" "$size"
+  done
+}
+
+collect_pipx() {
+  command -v pipx >/dev/null 2>&1 || return 0
+  local base="$HOME/.local/pipx/venvs"
+  pipx list 2>/dev/null | /usr/bin/sed -n 's/^package \(.*\) \([0-9][^ ]*\),.*/\1\t\2/p' |
+    while IFS=$'\t' read -r name version; do
+      local location="$base/$name"
+      local size
+      size=$(human_size "$location")
+      printf 'pipx\tvenv\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
+    done
+}
+
+collect_pip3() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - <<'PY'
+import importlib.metadata as md
+import os
+
+def size_of(path):
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, _, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+def human(n):
+    units = ["B", "K", "M", "G", "T"]
+    size = float(n)
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024.0
+        unit += 1
+    if unit == 0:
+        return f"{int(size)}{units[unit]}"
+    if size >= 10:
+        return f"{size:.0f}{units[unit]}"
+    return f"{size:.1f}{units[unit]}"
+
+for dist in sorted(md.distributions(), key=lambda d: d.metadata.get("Name", "").lower()):
+    name = dist.metadata.get("Name")
+    version = dist.version or "-"
+    if not name:
+        continue
+    try:
+        base = str(dist.locate_file(""))
+    except Exception:
+        base = "-"
+    path = base
+    try:
+        files = list(dist.files or [])
+    except Exception:
+        files = []
+    tops = []
+    for f in files:
+        parts = getattr(f, "parts", ())
+        if not parts:
+            continue
+        top = parts[0]
+        if top.endswith(".dist-info") or top.endswith(".egg-info") or top == "__pycache__":
+            continue
+        candidate = os.path.join(base, top)
+        if os.path.exists(candidate):
+            tops.append(candidate)
+    tops = sorted(set(tops))
+    if tops:
+        path = tops[0]
+        total = sum(size_of(p) for p in tops)
+    else:
+        total = size_of(base) if os.path.exists(base) else 0
+    print(f"pip3\tpackage\t{name}\t{version}\t{path}\t{human(total) if total else '-'}")
+PY
+}
+
+collect_gem() {
+  command -v gem >/dev/null 2>&1 || return 0
+  local gemdir
+  gemdir=$(gem environment gemdir 2>/dev/null)
+  gem list 2>/dev/null | /usr/bin/tr ',' '\n' | /usr/bin/sed -E 's/^ *//; s/ *$//; /^$/d' |
+    while IFS= read -r line; do
+      [[ "$line" =~ '^([^ ]+) \(([^)]*)\)$' ]] || continue
+      local name=${match[1]}
+      local version=${match[2]}
+      local matches
+      matches=(${gemdir}/gems/${name}-*(N))
+      local location='-'
+      [[ ${#matches[@]} -gt 0 ]] && location=${matches[1]}
+      local size
+      size=$(human_size "$location")
+      printf 'gem\tpackage\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
+    done
+}
+
+collect_cargo() {
+  command -v cargo >/dev/null 2>&1 || return 0
+  local cargobin="${CARGO_HOME:-$HOME/.cargo}/bin"
+  cargo install --list 2>/dev/null | /usr/bin/sed -n 's/^\([^ ]*\) v\(.*\):$/\1\t\2/p' |
+    while IFS=$'\t' read -r name version; do
+      local location="$cargobin/$name"
+      local size
+      size=$(human_size "$location")
+      printf 'cargo\tcrate\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
+    done
+}
+
+collect_mas() {
+  command -v mas >/dev/null 2>&1 || return 0
+  mas list 2>/dev/null | /usr/bin/sed -E 's/^([0-9]+) (.*) \((.*)\)$/\1\t\2\t\3/' |
+    while IFS=$'\t' read -r app_id name version; do
+      local location
+      location=$(mdfind "kMDItemAppStoreAdamID == $app_id" | /usr/bin/head -n 1)
+      [[ -n "$location" ]] || location="/Applications/$name.app"
+      local size
+      size=$(human_size "$location")
+      printf 'mas\tapp\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
+    done
+}
+
+collect_rows() {
+  {
+    collect_brew
+    collect_npm_family npm
+    collect_npm_family pnpm
+    collect_npm_family yarn
+    collect_npm_family bun
+    collect_pipx
+    collect_pip3
+    collect_gem
+    collect_cargo
+    collect_mas
+  } | /usr/bin/awk -F '\t' 'NF == 6 && $3 != "" { print }'
+}
+
+rows=$(collect_rows)
+if [[ -z "$rows" ]]; then
+  print -P "%F{220}%BNo supported package managers found.%f%b"
+  exit 0
+fi
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/checkinstalls.XXXXXX") || exit 1
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+rows_file="$tmpdir/rows.tsv"
+printf '%s\n' "$rows" | /usr/bin/sort -t $'\t' -k1,1 -k2,2 -k3,3f > "$rows_file"
+
+summary_file="$tmpdir/summary.tsv"
+printf '%s\n' "$rows" | /usr/bin/awk -F '\t' '{count[$1]++} END {for (k in count) print k "\t" count[k]}' | /usr/bin/sort -t $'\t' -k2,2nr > "$summary_file"
+
+manager_count=$(/usr/bin/cut -f1 "$rows_file" | /usr/bin/sort -u | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+package_count=$(/usr/bin/wc -l < "$rows_file" | /usr/bin/tr -d ' ')
+type_count=$(/usr/bin/cut -f2 "$rows_file" | /usr/bin/sort -u | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+top_manager=$(/usr/bin/head -n1 "$summary_file" | /usr/bin/awk -F '\t' '{print $1}')
+top_count=$(/usr/bin/head -n1 "$summary_file" | /usr/bin/awk -F '\t' '{print $2}')
+js_count=$(/usr/bin/awk -F '\t' '$1=="npm" || $1=="pnpm" || $1=="yarn" || $1=="bun" {n++} END {print n+0}' "$rows_file")
+py_count=$(/usr/bin/awk -F '\t' '$1=="pip3" || $1=="pipx" {n++} END {print n+0}' "$rows_file")
+devtools_count=$(/usr/bin/awk -F '\t' '$1=="brew" || $1=="cargo" || $1=="gem" {n++} END {print n+0}' "$rows_file")
+total_disk=$(/usr/bin/awk -F '\t' '
+  function norm(v,   n,u,m) {
+    n=v
+    gsub(/ /, "", n)
+    if (n == "-" || n == "") return 0
+    u=substr(n, length(n), 1)
+    sub(/[A-Za-z]$/, "", n)
+    m = (u=="T"?1024*1024*1024*1024:(u=="G"?1024*1024*1024:(u=="M"?1024*1024:(u=="K"?1024:1))))
+    return n * m
+  }
+  { total += norm($6) }
+  END {
+    if (total >= 1024*1024*1024) printf "%.1fG", total/(1024*1024*1024)
+    else if (total >= 1024*1024) printf "%.1fM", total/(1024*1024)
+    else if (total >= 1024) printf "%.1fK", total/1024
+    else printf "%dB", total
+  }' "$rows_file")
+now=$(date '+%H:%M:%S')
+host_name=$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo mac)
+shell_name=${SHELL:t}
+max_count=$(/usr/bin/awk -F '\t' 'BEGIN {m=0} $2>m {m=$2} END {print m+0}' "$summary_file")
+
+header_file="$tmpdir/header.txt"
+{
+  printf '\033[1;38;5;117mcheck installs TUI\033[0m\n'
+  printf '\033[38;5;244mhost:\033[0m %s   \033[38;5;244mshell:\033[0m %s   \033[38;5;244mtime:\033[0m %s   \033[38;5;244mtotal disk:\033[0m %s\n' "$host_name" "$shell_name" "$now" "$total_disk"
+  printf '\033[38;5;81mManagers\033[0m %s   \033[38;5;81mPackages\033[0m %s   \033[38;5;81mTypes\033[0m %s   \033[38;5;81mTop\033[0m %s (%s)\n' "$manager_count" "$package_count" "$type_count" "$top_manager" "$top_count"
+  printf '\033[38;5;45mJS\033[0m %s   \033[38;5;117mPython\033[0m %s   \033[38;5;173mDevtools\033[0m %s\n' "$js_count" "$py_count" "$devtools_count"
+  printf '\033[1;38;5;111mDistribution\033[0m\n'
+  while IFS=$'\t' read -r manager count; do
+    color=$(manager_color "$manager")
+    bar=$(bar_for "$count" "$max_count" "$GRAPH_W")
+    printf '%s%-10s\033[0m %4s %s\n' "$color" "$manager" "$count" "$bar"
+  done < "$summary_file"
+  printf '\n'
+} > "$header_file"
+
+list_file="$tmpdir/list.txt"
+/usr/bin/awk -F '\t' -v mw="$MANAGER_W" -v tw="$TYPE_W" -v pw="$PACKAGE_W" -v vw="$VERSION_W" '
+  function color_for_manager(manager) {
+    if (manager == "brew") return "\033[38;5;81m"
+    if (manager == "npm") return "\033[38;5;214m"
+    if (manager == "pnpm") return "\033[38;5;220m"
+    if (manager == "yarn") return "\033[38;5;45m"
+    if (manager == "bun") return "\033[38;5;216m"
+    if (manager == "pipx") return "\033[38;5;141m"
+    if (manager == "pip3") return "\033[38;5;117m"
+    if (manager == "gem") return "\033[38;5;204m"
+    if (manager == "cargo") return "\033[38;5;173m"
+    if (manager == "mas") return "\033[38;5;150m"
+    return "\033[38;5;250m"
+  }
+  function trunc(s, n) { return length(s) > n ? substr(s, 1, n - 1) "…" : s }
+  {
+    display = sprintf("%s%-*s\033[0m \033[38;5;244m%-*s\033[0m %-*s %-*s",
+      color_for_manager($1), mw, trunc($1, mw), tw, trunc($2, tw), pw, trunc($3, pw), vw, trunc($4, vw))
+    printf "%s¦%s¦%s¦%s¦%s¦%s¦%s\n", display, $1, $2, $3, $4, $5, $6
+  }
+' "$rows_file" > "$list_file"
+
+preview_script="$tmpdir/preview.zsh"
+cat > "$preview_script" <<'PREVIEW'
+#!/bin/zsh
+line="$1"
+manager=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $2}')
+type=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $3}')
+package=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $4}')
+version=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $5}')
+path=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $6}')
+size=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $7}')
+printf '\033[1;38;5;117mSelection\033[0m\n\n'
+printf 'manager : %s\n' "$manager"
+printf 'type    : %s\n' "$type"
+printf 'package : %s\n' "$package"
+printf 'version : %s\n' "$version"
+printf 'path    : %s\n' "$path"
+printf 'size    : %s\n' "$size"
+printf '\n\033[1;38;5;111mManager Graph\033[0m\n\n'
+/usr/bin/awk -F '\t' -v sel="$manager" -v max="$max_count" '
+  function color(name) {
+    if (name == "brew") return "\033[38;5;81m"
+    if (name == "npm") return "\033[38;5;214m"
+    if (name == "pnpm") return "\033[38;5;220m"
+    if (name == "yarn") return "\033[38;5;45m"
+    if (name == "bun") return "\033[38;5;216m"
+    if (name == "pipx") return "\033[38;5;141m"
+    if (name == "pip3") return "\033[38;5;117m"
+    if (name == "gem") return "\033[38;5;204m"
+    if (name == "cargo") return "\033[38;5;173m"
+    if (name == "mas") return "\033[38;5;150m"
+    return "\033[38;5;250m"
+  }
+  function bar(n,w,  i,out,c) {
+    c=int((n/max)*w)
+    if(c<1 && n>0) c=1
+    out=""
+    for(i=0;i<c;i++) out=out "▇"
+    return out
+  }
+  {
+    c = ($1==sel ? color($1) : "\033[38;5;244m")
+    printf "%s%-10s\033[0m %4s %s\n", c, $1, $2, bar($2, 18)
+  }
+' "$summary_file"
+PREVIEW
+chmod +x "$preview_script"
+
+if command -v fzf >/dev/null 2>&1; then
+  fzf --ansi --no-sort --layout=reverse-list --height=100% --border=rounded \
+      --list-border=rounded --list-label=' MANAGER       TYPE       PACKAGE                            VERSION ' \
+      --input-border=rounded --input-label=' Search ' \
+      --header="$(cat "$header_file")" --header-border=rounded --header-label=' check installs TUI ' \
+      --prompt=' search > ' --pointer='>' --marker='*' \
+      --info=inline-right \
+      --delimiter='¦' --with-nth='1' \
+      --preview-window='right:34%,wrap,border-left' \
+      --preview="$preview_script {}" \
+      --color='bg+:#2a2a3a,fg+:#e6e6ff,hl:#7dcfff,hl+:#ffd787,border:#b48ead,prompt:#8fbcbb,pointer:#a3be8c,marker:#ebcb8b,header:#c0caf5,label:#b48ead' \
+      < "$list_file"
+else
+  /usr/bin/less -R "$list_file"
+fi
