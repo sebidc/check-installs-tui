@@ -10,6 +10,20 @@ PACKAGE_W=34
 VERSION_W=16
 GRAPH_W=22
 
+# Loading animation spinner
+show_loading() {
+  local pid=$1
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0
+  
+  while kill -0 $pid 2>/dev/null; do
+    printf '\r\033[38;5;117m%s\033[0m Loading package information...' "${frames[$((i % ${#frames[@]}))]}"
+    ((i++))
+    sleep 0.1
+  done
+  printf '\r\033[K' # Clear the line
+}
+
 human_size() {
   local path=$1
   [[ -e "$path" ]] || {
@@ -51,6 +65,52 @@ manager_color() {
     cargo) printf '\033[38;5;173m' ;;
     mas) printf '\033[38;5;150m' ;;
     *) printf '\033[38;5;250m' ;;
+  esac
+}
+
+get_package_source() {
+  local manager=$1
+  local package=$2
+  local type=$3
+  
+  case "$manager" in
+    brew)
+      if [[ "$type" == "cask" ]]; then
+        printf "homebrew-cask"
+      else
+        printf "homebrew-core"
+      fi
+      ;;
+    npm)
+      printf "npm registry"
+      ;;
+    pnpm)
+      printf "pnpm registry"
+      ;;
+    yarn)
+      printf "yarn registry"
+      ;;
+    bun)
+      printf "bun registry"
+      ;;
+    pipx)
+      printf "pipx"
+      ;;
+    pip3)
+      printf "PyPI"
+      ;;
+    gem)
+      printf "rubygems.org"
+      ;;
+    cargo)
+      printf "crates.io"
+      ;;
+    mas)
+      printf "App Store"
+      ;;
+    *)
+      printf "unknown"
+      ;;
   esac
 }
 
@@ -256,7 +316,15 @@ collect_rows() {
   } | /usr/bin/awk -F '\t' 'NF == 6 && $3 != "" { print }'
 }
 
+# Start loading animation in background
+(show_loading $$) &
+local loader_pid=$!
+
 rows=$(collect_rows)
+
+# Wait for loader to finish
+wait $loader_pid 2>/dev/null
+
 if [[ -z "$rows" ]]; then
   print -P "%F{220}%BNo supported package managers found.%f%b"
   exit 0
@@ -349,11 +417,54 @@ package=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $4}')
 version=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $5}')
 path=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $6}')
 size=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $7}')
+
+# Get the source registry/repository for the package
+case "$manager" in
+  brew)
+    if [[ "$type" == "cask" ]]; then
+      source="homebrew-cask"
+    else
+      source="homebrew-core"
+    fi
+    ;;
+  npm)
+    source="npm registry"
+    ;;
+  pnpm)
+    source="pnpm registry"
+    ;;
+  yarn)
+    source="yarn registry"
+    ;;
+  bun)
+    source="bun registry"
+    ;;
+  pipx)
+    source="pipx"
+    ;;
+  pip3)
+    source="PyPI"
+    ;;
+  gem)
+    source="rubygems.org"
+    ;;
+  cargo)
+    source="crates.io"
+    ;;
+  mas)
+    source="App Store"
+    ;;
+  *)
+    source="unknown"
+    ;;
+esac
+
 printf '\033[1;38;5;117mSelection\033[0m\n\n'
 printf 'manager : %s\n' "$manager"
 printf 'type    : %s\n' "$type"
 printf 'package : %s\n' "$package"
 printf 'version : %s\n' "$version"
+printf 'source  : \033[38;5;214m%s\033[0m\n' "$source"
 printf 'path    : %s\n' "$path"
 printf 'size    : %s\n' "$size"
 printf '\n\033[1;38;5;111mManager Graph\033[0m\n\n'
