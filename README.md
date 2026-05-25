@@ -36,6 +36,11 @@ brew install check-installs-tui
 ```sh
 check-installs-tui
 ```
+or
+
+```sh
+ci
+```
 
 Layout:
 
