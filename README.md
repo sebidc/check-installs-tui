@@ -1,3 +1,5 @@
+<img width="1004" height="634" alt="image" src="https://github.com/user-attachments/assets/34469731-b955-433d-8ce3-9c2e5f69eb14" />
+
 # check installs TUI
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
