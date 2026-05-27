@@ -15,6 +15,9 @@ This release promotes the newer dashboard experience that was added after the ea
 
 - Full-screen curses dashboard with package list, search, package details, and manager distribution graph.
 - Animated loading screen that reports the manager currently being scanned, such as `loading brew packages` or `loading npm packages`.
+
+<img width="967" height="597" alt="image" src="https://github.com/user-attachments/assets/d5ab4dbd-e585-4937-af56-7df6991acdfc" />
+
 - Progress details below the loading bar so the bar stays clean and readable.
 - Mouse wheel and keyboard navigation for package rows and detail popups.
 - Selection popup with copy actions for package fields.
