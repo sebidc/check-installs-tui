@@ -1,4 +1,4 @@
-<img width="1004" height="634" alt="image" src="https://github.com/user-attachments/assets/34469731-b955-433d-8ce3-9c2e5f69eb14" />
+<img width="967" height="597" alt="image" src="https://github.com/user-attachments/assets/3de5c9e7-3f73-497c-858e-9c63ea774273" />
 
 # check installs TUI
 
