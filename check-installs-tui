@@ -1,403 +1,1221 @@
-#!/bin/zsh
-
-emulate -L zsh
-setopt pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-
-MANAGER_W=12
-TYPE_W=10
-PACKAGE_W=34
-VERSION_W=16
-GRAPH_W=22
-
-human_size() {
-  local path=$1
-  [[ -e "$path" ]] || {
-    printf '%s' '-'
-    return 0
-  }
-  /usr/bin/du -sh "$path" 2>/dev/null | /usr/bin/awk '{print $1}'
-}
-
-trim_path() {
-  local path=$1
-  [[ -n "$path" ]] || {
-    printf '%s' '-'
-    return 0
-  }
-  printf '%s' "$path"
-}
-
-bar_for() {
-  local count=$1
-  local max=$2
-  local width=$3
-  local filled=0
-  (( max > 0 )) && filled=$(( count * width / max ))
-  (( filled < 1 && count > 0 )) && filled=1
-  printf '%*s' "$filled" '' | /usr/bin/tr ' ' '▇'
-}
-
-manager_color() {
-  case "$1" in
-    brew) printf '\033[38;5;81m' ;;
-    npm) printf '\033[38;5;214m' ;;
-    pnpm) printf '\033[38;5;220m' ;;
-    yarn) printf '\033[38;5;45m' ;;
-    bun) printf '\033[38;5;216m' ;;
-    pipx) printf '\033[38;5;141m' ;;
-    pip3) printf '\033[38;5;117m' ;;
-    gem) printf '\033[38;5;204m' ;;
-    cargo) printf '\033[38;5;173m' ;;
-    mas) printf '\033[38;5;150m' ;;
-    *) printf '\033[38;5;250m' ;;
-  esac
-}
-
-collect_brew() {
-  command -v brew >/dev/null 2>&1 || return 0
-  local cellar prefix name versions location size
-  cellar=$(brew --cellar 2>/dev/null)
-  prefix=$(brew --prefix 2>/dev/null)
-
-  brew list --versions 2>/dev/null | while read -r name versions; do
-    location="$cellar/$name"
-    size=$(human_size "$location")
-    printf 'brew\tformula\t%s\t%s\t%s\t%s\n' "$name" "${versions:--}" "$(trim_path "$location")" "$size"
-  done
-
-  brew list --cask --versions 2>/dev/null | while read -r name versions; do
-    location="$prefix/Caskroom/$name"
-    size=$(human_size "$location")
-    printf 'brew\tcask\t%s\t%s\t%s\t%s\n' "$name" "${versions:--}" "$(trim_path "$location")" "$size"
-  done
-}
-
-collect_npm_family() {
-  local pm=$1
-  local root output location size name version
-  command -v "$pm" >/dev/null 2>&1 || return 0
-
-  case "$pm" in
-    npm)
-      root=$(npm root -g 2>/dev/null)
-      output=$(npm -g ls --depth=0 2>/dev/null | /usr/bin/sed '1d' | /usr/bin/sed -E 's/^[[:space:]]*[├└]── //')
-      ;;
-    pnpm)
-      root=$(pnpm root -g 2>/dev/null)
-      output=$(pnpm ls -g --depth=0 2>/dev/null | /usr/bin/sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | /usr/bin/sed -n 's/^[[:space:]]*[├└]── //p')
-      ;;
-    yarn)
-      root="$(yarn global dir 2>/dev/null)/node_modules"
-      output=$(yarn global list --depth=0 2>/dev/null | /usr/bin/sed -n 's/^info "\(.*\)@\(.*\)$/\1@\2/p')
-      ;;
-    bun)
-      root="${BUN_INSTALL:-$HOME/.bun}/install/global/node_modules"
-      output=$(bun pm ls -g 2>/dev/null | /usr/bin/sed -n 's/^.* \([^ @][^@]*\)@\([^ ]*\).*$/\1@\2/p')
-      ;;
-  esac
-
-  printf '%s\n' "$output" | while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    if [[ "$line" == @*/*@* ]]; then
-      version=${line##*@}
-      name=${line%@"$version"}
-    elif [[ "$line" == *@* ]]; then
-      version=${line##*@}
-      name=${line%@"$version"}
-    else
-      name=$line
-      version='-'
-    fi
-    location="$root/$name"
-    size=$(human_size "$location")
-    printf '%s\tglobal\t%s\t%s\t%s\t%s\n' "$pm" "$name" "$version" "$(trim_path "$location")" "$size"
-  done
-}
-
-collect_pipx() {
-  command -v pipx >/dev/null 2>&1 || return 0
-  local base="$HOME/.local/pipx/venvs"
-  pipx list 2>/dev/null | /usr/bin/sed -n 's/^package \(.*\) \([0-9][^ ]*\),.*/\1\t\2/p' |
-    while IFS=$'\t' read -r name version; do
-      local location="$base/$name"
-      local size
-      size=$(human_size "$location")
-      printf 'pipx\tvenv\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
-    done
-}
-
-collect_pip3() {
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 - <<'PY'
-import importlib.metadata as md
+#!/usr/bin/env python3
+import curses
+import json
+import locale
 import os
+import platform
+import shutil
+import socket
+import subprocess
+import urllib.parse
+import sys
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List
 
-def size_of(path):
+locale.setlocale(locale.LC_ALL, "")
+
+RESET = "\033[0m"
+RAINBOW = [196, 202, 226, 82, 51, 45, 99, 201]
+DOTS = ["", ".", "..", "..."]
+BORDER = 1
+PADDING = 1
+SEARCH_HEIGHT = 3
+MIN_DASHBOARD_HEIGHT = 6
+MIN_SIDEBAR = 28
+BG_HEX = 0x1F, 0x1E, 0x2E
+
+
+@dataclass
+class PackageRow:
+    manager: str
+    ptype: str
+    name: str
+    version: str
+    path: str
+    size: str
+    origin: str = "-"
+
+
+def run(cmd: List[str]) -> str:
     try:
-        if os.path.isfile(path):
-            return os.path.getsize(path)
-        total = 0
-        for root, _, files in os.walk(path):
-            for f in files:
-                fp = os.path.join(root, f)
-                try:
-                    total += os.path.getsize(fp)
-                except OSError:
-                    pass
-        return total
-    except OSError:
-        return 0
-
-def human(n):
-    units = ["B", "K", "M", "G", "T"]
-    size = float(n)
-    unit = 0
-    while size >= 1024 and unit < len(units) - 1:
-        size /= 1024.0
-        unit += 1
-    if unit == 0:
-        return f"{int(size)}{units[unit]}"
-    if size >= 10:
-        return f"{size:.0f}{units[unit]}"
-    return f"{size:.1f}{units[unit]}"
-
-for dist in sorted(md.distributions(), key=lambda d: d.metadata.get("Name", "").lower()):
-    name = dist.metadata.get("Name")
-    version = dist.version or "-"
-    if not name:
-        continue
-    try:
-        base = str(dist.locate_file(""))
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return proc.stdout.strip()
     except Exception:
-        base = "-"
-    path = base
+        return ""
+
+
+def path_size(path: str) -> str:
+    if not path or path == "-" or not os.path.exists(path):
+        return "-"
+    out = run(["/usr/bin/du", "-sh", path])
+    return out.split()[0] if out else "-"
+
+
+def add_row(rows: list[PackageRow], manager: str, ptype: str, name: str, version: str, path: str, origin: str = "-") -> None:
+    rows.append(
+        PackageRow(
+            manager=manager,
+            ptype=ptype,
+            name=name,
+            version=version or "-",
+            path=path or "-",
+            size=path_size(path),
+            origin=origin or "-",
+        )
+    )
+
+
+def brew_tap_remotes() -> dict[str, str]:
+    out = run(["brew", "tap-info", "--json", "--installed"])
+    if not out:
+        return {}
     try:
-        files = list(dist.files or [])
-    except Exception:
-        files = []
-    tops = []
-    for f in files:
-        parts = getattr(f, "parts", ())
+        taps = json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+    remotes: dict[str, str] = {}
+    for tap in taps:
+        name = tap.get("name")
+        remote = tap.get("remote")
+        if name and remote:
+            remotes[name] = remote
+    return remotes
+
+
+def brew_installed_metadata() -> tuple[dict[str, dict], dict[str, dict]]:
+    out = run(["brew", "info", "--json=v2", "--installed"])
+    if not out:
+        return {}, {}
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return {}, {}
+    formulae = {item.get("name"): item for item in data.get("formulae", []) if item.get("name")}
+    casks = {item.get("token") or item.get("name"): item for item in data.get("casks", []) if item.get("token") or item.get("name")}
+    return formulae, casks
+
+
+def brew_origin(name: str, fallback_tap: str, metadata: dict[str, dict], tap_remotes: dict[str, str]) -> str:
+    tap = metadata.get(name, {}).get("tap") or fallback_tap
+    return tap_remotes.get(tap, tap)
+
+
+def collect_brew(rows: list[PackageRow]) -> None:
+    if not shutil.which("brew"):
+        return
+    cellar = run(["brew", "--cellar"])
+    prefix = run(["brew", "--prefix"])
+    tap_remotes = brew_tap_remotes()
+    formula_meta, cask_meta = brew_installed_metadata()
+    formulae = run(["brew", "list", "--versions"])
+    for line in formulae.splitlines():
+        parts = line.split()
         if not parts:
             continue
-        top = parts[0]
-        if top.endswith(".dist-info") or top.endswith(".egg-info") or top == "__pycache__":
+        name = parts[0]
+        version = " ".join(parts[1:]) or "-"
+        origin = brew_origin(name, "homebrew/core", formula_meta, tap_remotes)
+        add_row(rows, "brew", "formula", name, version, f"{cellar}/{name}", origin)
+    casks = run(["brew", "list", "--cask", "--versions"])
+    for line in casks.splitlines():
+        parts = line.split()
+        if not parts:
             continue
-        candidate = os.path.join(base, top)
-        if os.path.exists(candidate):
-            tops.append(candidate)
-    tops = sorted(set(tops))
-    if tops:
-        path = tops[0]
-        total = sum(size_of(p) for p in tops)
-    else:
-        total = size_of(base) if os.path.exists(base) else 0
-    print(f"pip3\tpackage\t{name}\t{version}\t{path}\t{human(total) if total else '-'}")
-PY
-}
+        name = parts[0]
+        version = " ".join(parts[1:]) or "-"
+        origin = brew_origin(name, "homebrew/cask", cask_meta, tap_remotes)
+        add_row(rows, "brew", "cask", name, version, f"{prefix}/Caskroom/{name}", origin)
 
-collect_gem() {
-  command -v gem >/dev/null 2>&1 || return 0
-  local gemdir
-  gemdir=$(gem environment gemdir 2>/dev/null)
-  gem list 2>/dev/null | /usr/bin/tr ',' '\n' | /usr/bin/sed -E 's/^ *//; s/ *$//; /^$/d' |
-    while IFS= read -r line; do
-      [[ "$line" =~ '^([^ ]+) \(([^)]*)\)$' ]] || continue
-      local name=${match[1]}
-      local version=${match[2]}
-      local matches
-      matches=(${gemdir}/gems/${name}-*(N))
-      local location='-'
-      [[ ${#matches[@]} -gt 0 ]] && location=${matches[1]}
-      local size
-      size=$(human_size "$location")
-      printf 'gem\tpackage\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
-    done
-}
 
-collect_cargo() {
-  command -v cargo >/dev/null 2>&1 || return 0
-  local cargobin="${CARGO_HOME:-$HOME/.cargo}/bin"
-  cargo install --list 2>/dev/null | /usr/bin/sed -n 's/^\([^ ]*\) v\(.*\):$/\1\t\2/p' |
-    while IFS=$'\t' read -r name version; do
-      local location="$cargobin/$name"
-      local size
-      size=$(human_size "$location")
-      printf 'cargo\tcrate\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
-    done
-}
+def collect_npm_family(rows: list[PackageRow], pm: str) -> None:
+    if not shutil.which(pm):
+        return
+    root = ""
+    lines: list[str] = []
+    origin = "registry.npmjs.org"
+    if pm == "npm":
+        root = run(["npm", "root", "-g"])
+        output = run(["npm", "-g", "ls", "--depth=0"])
+        lines = [ln.strip().lstrip("├└─ ") for ln in output.splitlines()[1:] if "@" in ln]
+    elif pm == "pnpm":
+        root = run(["pnpm", "root", "-g"])
+        output = run(["pnpm", "ls", "-g", "--depth=0"])
+        lines = [ln.strip().lstrip("├└─ ") for ln in output.splitlines() if "@" in ln]
+    elif pm == "yarn":
+        root = f"{run(['yarn', 'global', 'dir'])}/node_modules"
+        output = run(["yarn", "global", "list", "--depth=0"])
+        for line in output.splitlines():
+            if line.startswith("info ") and "@" in line:
+                lines.append(line.split("info ", 1)[1].strip('"'))
+    elif pm == "bun":
+        bun_install = os.environ.get("BUN_INSTALL", f"{Path.home()}/.bun")
+        root = f"{bun_install}/install/global/node_modules"
+        output = run(["bun", "pm", "ls", "-g"])
+        lines = [ln.strip() for ln in output.splitlines() if "@" in ln]
+    for line in lines:
+        if line.startswith("@"):
+            name, _, version = line.rpartition("@")
+        else:
+            name, _, version = line.partition("@")
+        if not name:
+            continue
+        add_row(rows, pm, "global", name, version or "-", os.path.join(root, name), origin)
 
-collect_mas() {
-  command -v mas >/dev/null 2>&1 || return 0
-  mas list 2>/dev/null | /usr/bin/sed -E 's/^([0-9]+) (.*) \((.*)\)$/\1\t\2\t\3/' |
-    while IFS=$'\t' read -r app_id name version; do
-      local location
-      location=$(mdfind "kMDItemAppStoreAdamID == $app_id" | /usr/bin/head -n 1)
-      [[ -n "$location" ]] || location="/Applications/$name.app"
-      local size
-      size=$(human_size "$location")
-      printf 'mas\tapp\t%s\t%s\t%s\t%s\n' "$name" "$version" "$(trim_path "$location")" "$size"
-    done
-}
 
-collect_rows() {
-  {
-    collect_brew
-    collect_npm_family npm
-    collect_npm_family pnpm
-    collect_npm_family yarn
-    collect_npm_family bun
-    collect_pipx
-    collect_pip3
-    collect_gem
-    collect_cargo
-    collect_mas
-  } | /usr/bin/awk -F '\t' 'NF == 6 && $3 != "" { print }'
-}
+def collect_pipx(rows: list[PackageRow]) -> None:
+    if not shutil.which("pipx"):
+        return
+    base = Path.home() / ".local" / "pipx" / "venvs"
+    output = run(["pipx", "list"])
+    for line in output.splitlines():
+        if not line.startswith("package "):
+            continue
+        payload = line[len("package "):]
+        parts = payload.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        version = parts[1].rstrip(",")
+        add_row(rows, "pipx", "venv", name, version, str(base / name), "pypi.org")
 
-rows=$(collect_rows)
-if [[ -z "$rows" ]]; then
-  print -P "%F{220}%BNo supported package managers found.%f%b"
-  exit 0
-fi
 
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/checkinstalls.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
+def collect_pip3(rows: list[PackageRow]) -> None:
+    if not shutil.which("python3"):
+        return
+    code = r'''
+import importlib.metadata as md
+import os
+from pathlib import Path
+for dist in md.distributions():
+    name = dist.metadata.get("Name") or dist.metadata.get("Summary") or "unknown"
+    version = dist.version or "-"
+    path = str(Path(dist.locate_file('')).resolve())
+    print(f"{name}\t{version}\t{path}")
+'''
+    out = run(["python3", "-c", code])
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        add_row(rows, "pip3", "site", parts[0], parts[1], parts[2], "pypi.org")
 
-rows_file="$tmpdir/rows.tsv"
-printf '%s\n' "$rows" | /usr/bin/sort -t $'\t' -k1,1 -k2,2 -k3,3f > "$rows_file"
 
-summary_file="$tmpdir/summary.tsv"
-printf '%s\n' "$rows" | /usr/bin/awk -F '\t' '{count[$1]++} END {for (k in count) print k "\t" count[k]}' | /usr/bin/sort -t $'\t' -k2,2nr > "$summary_file"
+def collect_gem(rows: list[PackageRow]) -> None:
+    if not shutil.which("gem"):
+        return
+    gem_home = run(["gem", "environment", "gemdir"])
+    output = run(["gem", "list"])
+    for line in output.splitlines():
+        if "(" not in line:
+            continue
+        name = line.split("(", 1)[0].strip()
+        version = line.split("(", 1)[1].rstrip(")").split(",")[0].strip()
+        add_row(rows, "gem", "package", name, version, f"{gem_home}/gems/{name}-{version}", "rubygems.org")
 
-manager_count=$(/usr/bin/cut -f1 "$rows_file" | /usr/bin/sort -u | /usr/bin/wc -l | /usr/bin/tr -d ' ')
-package_count=$(/usr/bin/wc -l < "$rows_file" | /usr/bin/tr -d ' ')
-type_count=$(/usr/bin/cut -f2 "$rows_file" | /usr/bin/sort -u | /usr/bin/wc -l | /usr/bin/tr -d ' ')
-top_manager=$(/usr/bin/head -n1 "$summary_file" | /usr/bin/awk -F '\t' '{print $1}')
-top_count=$(/usr/bin/head -n1 "$summary_file" | /usr/bin/awk -F '\t' '{print $2}')
-js_count=$(/usr/bin/awk -F '\t' '$1=="npm" || $1=="pnpm" || $1=="yarn" || $1=="bun" {n++} END {print n+0}' "$rows_file")
-py_count=$(/usr/bin/awk -F '\t' '$1=="pip3" || $1=="pipx" {n++} END {print n+0}' "$rows_file")
-devtools_count=$(/usr/bin/awk -F '\t' '$1=="brew" || $1=="cargo" || $1=="gem" {n++} END {print n+0}' "$rows_file")
-total_disk=$(/usr/bin/awk -F '\t' '
-  function norm(v,   n,u,m) {
-    n=v
-    gsub(/ /, "", n)
-    if (n == "-" || n == "") return 0
-    u=substr(n, length(n), 1)
-    sub(/[A-Za-z]$/, "", n)
-    m = (u=="T"?1024*1024*1024*1024:(u=="G"?1024*1024*1024:(u=="M"?1024*1024:(u=="K"?1024:1))))
-    return n * m
-  }
-  { total += norm($6) }
-  END {
-    if (total >= 1024*1024*1024) printf "%.1fG", total/(1024*1024*1024)
-    else if (total >= 1024*1024) printf "%.1fM", total/(1024*1024)
-    else if (total >= 1024) printf "%.1fK", total/1024
-    else printf "%dB", total
-  }' "$rows_file")
-now=$(date '+%H:%M:%S')
-host_name=$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo mac)
-shell_name=${SHELL:t}
-max_count=$(/usr/bin/awk -F '\t' 'BEGIN {m=0} $2>m {m=$2} END {print m+0}' "$summary_file")
 
-header_file="$tmpdir/header.txt"
-{
-  printf '\033[1;38;5;117mcheck installs TUI\033[0m\n'
-  printf '\033[38;5;244mhost:\033[0m %s   \033[38;5;244mshell:\033[0m %s   \033[38;5;244mtime:\033[0m %s   \033[38;5;244mtotal disk:\033[0m %s\n' "$host_name" "$shell_name" "$now" "$total_disk"
-  printf '\033[38;5;81mManagers\033[0m %s   \033[38;5;81mPackages\033[0m %s   \033[38;5;81mTypes\033[0m %s   \033[38;5;81mTop\033[0m %s (%s)\n' "$manager_count" "$package_count" "$type_count" "$top_manager" "$top_count"
-  printf '\033[38;5;45mJS\033[0m %s   \033[38;5;117mPython\033[0m %s   \033[38;5;173mDevtools\033[0m %s\n' "$js_count" "$py_count" "$devtools_count"
-  printf '\033[1;38;5;111mDistribution\033[0m\n'
-  while IFS=$'\t' read -r manager count; do
-    color=$(manager_color "$manager")
-    bar=$(bar_for "$count" "$max_count" "$GRAPH_W")
-    printf '%s%-10s\033[0m %4s %s\n' "$color" "$manager" "$count" "$bar"
-  done < "$summary_file"
-  printf '\n'
-} > "$header_file"
+def collect_cargo(rows: list[PackageRow]) -> None:
+    if not shutil.which("cargo"):
+        return
+    cargo_home = os.environ.get("CARGO_HOME", f"{Path.home()}/.cargo")
+    output = run(["cargo", "install", "--list"])
+    for line in output.splitlines():
+        if not line or line.startswith(" ") or " v" not in line:
+            continue
+        name, _, rest = line.partition(" v")
+        version = rest.rstrip(":").strip()
+        add_row(rows, "cargo", "crate", name.strip(), version, f"{cargo_home}/bin/{name.strip()}", "crates.io")
 
-list_file="$tmpdir/list.txt"
-/usr/bin/awk -F '\t' -v mw="$MANAGER_W" -v tw="$TYPE_W" -v pw="$PACKAGE_W" -v vw="$VERSION_W" '
-  function color_for_manager(manager) {
-    if (manager == "brew") return "\033[38;5;81m"
-    if (manager == "npm") return "\033[38;5;214m"
-    if (manager == "pnpm") return "\033[38;5;220m"
-    if (manager == "yarn") return "\033[38;5;45m"
-    if (manager == "bun") return "\033[38;5;216m"
-    if (manager == "pipx") return "\033[38;5;141m"
-    if (manager == "pip3") return "\033[38;5;117m"
-    if (manager == "gem") return "\033[38;5;204m"
-    if (manager == "cargo") return "\033[38;5;173m"
-    if (manager == "mas") return "\033[38;5;150m"
-    return "\033[38;5;250m"
-  }
-  function trunc(s, n) { return length(s) > n ? substr(s, 1, n - 1) "…" : s }
-  {
-    display = sprintf("%s%-*s\033[0m \033[38;5;244m%-*s\033[0m %-*s %-*s",
-      color_for_manager($1), mw, trunc($1, mw), tw, trunc($2, tw), pw, trunc($3, pw), vw, trunc($4, vw))
-    printf "%s¦%s¦%s¦%s¦%s¦%s¦%s\n", display, $1, $2, $3, $4, $5, $6
-  }
-' "$rows_file" > "$list_file"
 
-preview_script="$tmpdir/preview.zsh"
-cat > "$preview_script" <<'PREVIEW'
-#!/bin/zsh
-line="$1"
-manager=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $2}')
-type=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $3}')
-package=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $4}')
-version=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $5}')
-path=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $6}')
-size=$(printf '%s\n' "$line" | /usr/bin/awk -F '¦' '{print $7}')
-printf '\033[1;38;5;117mSelection\033[0m\n\n'
-printf 'manager : %s\n' "$manager"
-printf 'type    : %s\n' "$type"
-printf 'package : %s\n' "$package"
-printf 'version : %s\n' "$version"
-printf 'path    : %s\n' "$path"
-printf 'size    : %s\n' "$size"
-printf '\n\033[1;38;5;111mManager Graph\033[0m\n\n'
-/usr/bin/awk -F '\t' -v sel="$manager" -v max="$max_count" '
-  function color(name) {
-    if (name == "brew") return "\033[38;5;81m"
-    if (name == "npm") return "\033[38;5;214m"
-    if (name == "pnpm") return "\033[38;5;220m"
-    if (name == "yarn") return "\033[38;5;45m"
-    if (name == "bun") return "\033[38;5;216m"
-    if (name == "pipx") return "\033[38;5;141m"
-    if (name == "pip3") return "\033[38;5;117m"
-    if (name == "gem") return "\033[38;5;204m"
-    if (name == "cargo") return "\033[38;5;173m"
-    if (name == "mas") return "\033[38;5;150m"
-    return "\033[38;5;250m"
-  }
-  function bar(n,w,  i,out,c) {
-    c=int((n/max)*w)
-    if(c<1 && n>0) c=1
-    out=""
-    for(i=0;i<c;i++) out=out "▇"
-    return out
-  }
-  {
-    c = ($1==sel ? color($1) : "\033[38;5;244m")
-    printf "%s%-10s\033[0m %4s %s\n", c, $1, $2, bar($2, 18)
-  }
-' "$summary_file"
-PREVIEW
-chmod +x "$preview_script"
+def collect_mas(rows: list[PackageRow]) -> None:
+    if not shutil.which("mas"):
+        return
+    output = run(["mas", "list"])
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        app_id = parts[0]
+        version = parts[-1].strip("()")
+        name = " ".join(parts[1:-1])
+        add_row(rows, "mas", "app", name, version, "/Applications", f"mac-app-store:{app_id}")
 
-if command -v fzf >/dev/null 2>&1; then
-  fzf --ansi --no-sort --layout=reverse-list --height=100% --border=rounded \
-      --list-border=rounded --list-label=' MANAGER       TYPE       PACKAGE                            VERSION ' \
-      --input-border=rounded --input-label=' Search ' \
-      --header="$(cat "$header_file")" --header-border=rounded --header-label=' check installs TUI ' \
-      --prompt=' search > ' --pointer='>' --marker='*' \
-      --info=inline-right \
-      --delimiter='¦' --with-nth='1' \
-      --preview-window='right:34%,wrap,border-left' \
-      --preview="$preview_script {}" \
-      --color='bg+:#2a2a3a,fg+:#e6e6ff,hl:#7dcfff,hl+:#ffd787,border:#b48ead,prompt:#8fbcbb,pointer:#a3be8c,marker:#ebcb8b,header:#c0caf5,label:#b48ead' \
-      < "$list_file"
-else
-  /usr/bin/less -R "$list_file"
-fi
+
+def collect_rows(status: dict | None = None) -> list[PackageRow]:
+    rows: list[PackageRow] = []
+    collectors = [
+        ("brew", lambda: collect_brew(rows)),
+        ("npm", lambda: collect_npm_family(rows, "npm")),
+        ("pnpm", lambda: collect_npm_family(rows, "pnpm")),
+        ("yarn", lambda: collect_npm_family(rows, "yarn")),
+        ("bun", lambda: collect_npm_family(rows, "bun")),
+        ("pipx", lambda: collect_pipx(rows)),
+        ("pip3", lambda: collect_pip3(rows)),
+        ("gem", lambda: collect_gem(rows)),
+        ("cargo", lambda: collect_cargo(rows)),
+        ("mas", lambda: collect_mas(rows)),
+    ]
+    total = len(collectors)
+    for completed, (manager, collector) in enumerate(collectors):
+        if status is not None:
+            status.update({"current": manager, "completed": completed, "total": total, "count": len(rows)})
+        collector()
+    rows.sort(key=lambda r: (r.manager, r.ptype, r.name.lower()))
+    if status is not None:
+        status.update({"current": "complete", "completed": total, "total": total, "count": len(rows)})
+    return rows
+
+
+def terminal_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size((100, 30))
+    return size.lines, size.columns
+
+
+def ansi_at(y: int, x: int) -> str:
+    return f"\033[{max(1, y)};{max(1, x)}H"
+
+
+def loading_label(current: str) -> str:
+    labels = {
+        "starting": "starting checks",
+        "complete": "loading complete",
+        "brew": "loading brew packages",
+        "npm": "loading npm packages",
+        "pnpm": "loading pnpm packages",
+        "yarn": "loading yarn packages",
+        "bun": "loading bun packages",
+        "pipx": "loading pipx apps",
+        "pip3": "loading pip packages",
+        "gem": "loading ruby gems",
+        "cargo": "loading cargo crates",
+        "mas": "loading app store apps",
+    }
+    return labels.get(current, f"loading {current}")
+
+
+def render_loader(done_flag: dict, holder: dict) -> list[PackageRow]:
+    sys.stdout.write("\033[?1049h\033[?25l\033[H\033[2J\033[3J")
+    sys.stdout.flush()
+    tick = 0
+    logo = [
+        " ██████╗ ██╗",
+        "██╔════╝ ██║",
+        "██║      ██║",
+        "██║      ██║",
+        "╚██████╗ ██║",
+        " ╚═════╝ ╚═╝",
+    ]
+    try:
+        while not done_flag.get("done"):
+            rows, cols = terminal_size()
+            bar_w = max(18, min(52, cols - 18))
+            total = max(1, int(holder.get("total", 1)))
+            completed = min(total, int(holder.get("completed", 0)))
+            count = int(holder.get("count", 0))
+            current = str(holder.get("current", "starting"))
+            percent = min(99, int((completed / total) * 100))
+            filled = max(1, int((percent / 100) * bar_w)) if percent > 0 else 0
+            if percent == 0:
+                sweep_w = min(8, max(3, bar_w // 5))
+                sweep_x = tick % max(1, bar_w - sweep_w + 1)
+                block = "░" * sweep_x + "█" * sweep_w + "░" * (bar_w - sweep_x - sweep_w)
+            else:
+                block = "█" * filled + "░" * (bar_w - filled)
+            top = max(2, rows // 2 - 6)
+            sys.stdout.write("\033[H")
+            for i, line in enumerate(logo):
+                color = 45 if i < 2 else 117 if i < 4 else 109
+                x = max(1, (cols - len(line)) // 2)
+                sys.stdout.write(f"{ansi_at(top + i, x)}\033[38;5;{color}m{line}\033[0m")
+            title = "check installs"
+            tx = max(1, (cols - len(title)) // 2)
+            sys.stdout.write(f"{ansi_at(top + 7, tx)}\033[38;5;109m{title}\033[0m")
+            label_base = loading_label(current)
+            dot_cycle = ("   ", ".  ", ".. ", "...")
+            label = f"{label_base}{dot_cycle[(tick // 6) % len(dot_cycle)]}"
+            lx = max(1, (cols - len(label_base) - 3) // 2)
+            sys.stdout.write(f"{ansi_at(top + 9, lx)}\033[38;5;109m{label}\033[0m")
+            bx = max(1, (cols - bar_w) // 2)
+            by = top + 11
+            px = max(1, bx + (bar_w - 4) // 2)
+            stats = f"{completed:02d}/{total:02d} managers  {count:4d} installs"
+            sx = max(1, (cols - len(stats)) // 2)
+            sys.stdout.write(f"{ansi_at(by, bx)}\033[38;5;45m{block}\033[0m")
+            sys.stdout.write(f"{ansi_at(by + 1, px)}\033[38;5;109m{percent:>3}%\033[0m")
+            sys.stdout.write(f"{ansi_at(by + 2, sx)}\033[38;5;109m{stats}\033[0m")
+            sys.stdout.flush()
+            tick = (tick + 2) % (bar_w + 1)
+            time.sleep(0.08)
+        rows, cols = terminal_size()
+        bar_w = max(18, min(52, cols - 18))
+        bx = max(1, (cols - bar_w) // 2)
+        by = max(2, rows // 2 + 5)
+        sys.stdout.write("\033[H")
+        sys.stdout.write(f"{ansi_at(by, bx)}\033[38;5;45m{'█' * bar_w}\033[0m")
+        sys.stdout.write(f"{ansi_at(by + 1, max(1, bx + (bar_w - 4) // 2))}\033[38;5;109m100%\033[0m")
+        sys.stdout.flush()
+        time.sleep(0.12)
+    finally:
+        sys.stdout.write("\033[?25h\033[H\033[2J\033[3J\033[?1049l")
+        sys.stdout.flush()
+    return holder.get("rows", [])
+
+
+def collect_with_loader() -> list[PackageRow]:
+    holder: dict = {}
+    done_flag: dict = {"done": False}
+
+    def worker() -> None:
+        try:
+            holder["rows"] = collect_rows(holder)
+        finally:
+            done_flag["done"] = True
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    rows = render_loader(done_flag, holder)
+    thread.join()
+    return holder.get("rows", rows)
+
+
+def manager_bar_pairs(rows: list[PackageRow]) -> list[tuple[str, int]]:
+    counts = Counter(row.manager for row in rows)
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
+def human_total(rows: list[PackageRow]) -> str:
+    total = 0.0
+    for row in rows:
+        value = row.size or ""
+        if not value or value == "-":
+            continue
+        number = value[:-1] if value[-1].isalpha() else value
+        unit = value[-1].upper() if value[-1].isalpha() else "B"
+        try:
+            amount = float(number)
+        except ValueError:
+            continue
+        mult = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}.get(unit, 1)
+        total += amount * mult
+    if total >= 1024**3:
+        return f"{total / 1024**3:.1f}G"
+    if total >= 1024**2:
+        return f"{total / 1024**2:.1f}M"
+    if total >= 1024:
+        return f"{total / 1024:.1f}K"
+    return f"{int(total)}B"
+
+
+def build_tree_lines(path: str, max_children: int = 8) -> list[str]:
+    if not path or path == "-":
+        return ["(path unavailable)"]
+    abs_path = os.path.abspath(path)
+    lines = ["/"]
+    parts = [part for part in abs_path.split(os.sep) if part]
+    for depth, part in enumerate(parts):
+        prefix = "    " * depth
+        lines.append(f"{prefix}└── {part}")
+    if os.path.isdir(abs_path):
+        try:
+            children = sorted(os.listdir(abs_path))[:max_children]
+        except OSError:
+            children = []
+        prefix = "    " * len(parts)
+        for index, child in enumerate(children):
+            branch = "└──" if index == len(children) - 1 else "├──"
+            lines.append(f"{prefix}{branch} {child}")
+    return lines
+
+
+def open_in_finder(path: str) -> None:
+    if not path or path == "-":
+        return
+    try:
+        subprocess.Popen(["/usr/bin/open", "-R", path])
+    except Exception:
+        try:
+            subprocess.Popen(["/usr/bin/open", os.path.dirname(path) or path])
+        except Exception:
+            pass
+
+
+def copy_to_clipboard(value: str) -> None:
+    try:
+        subprocess.run(["/usr/bin/pbcopy"], input=value, text=True, check=False)
+    except Exception:
+        pass
+
+
+def path_formats(path: str) -> list[tuple[str, str]]:
+    if not path or path == "-":
+        path = ""
+    unix_path = path
+    url_path = f"file://{urllib.parse.quote(path)}" if path else ""
+    name = os.path.basename(path.rstrip(os.sep)) if path else ""
+    terminal_path = f"cd {shlex_quote(path)}" if path else ""
+    windows_path = path.replace('/', '\\') if path else ""
+    return [
+        ("unix", unix_path),
+        ("url", url_path),
+        ("name", name),
+        ("terminal", terminal_path),
+        ("windows", windows_path),
+    ]
+
+
+def shlex_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\''") + "'"
+
+
+class App:
+    def __init__(self, stdscr, rows: list[PackageRow]):
+        self.stdscr = stdscr
+        self.rows = rows
+        self.query = ""
+        self.filtered: list[PackageRow] = rows[:]
+        self.selected = 0
+        self.committed = None
+        self.scroll = 0
+        self.has_interacted = False
+        self.manager_pairs = manager_bar_pairs(rows)
+        self.now = datetime.now
+        self.host = socket.gethostname().split(".")[0]
+        self.shell = os.path.basename(os.environ.get("SHELL", "shell"))
+        self.total_disk = human_total(rows)
+        self.running = True
+        self.active_panes = ["packages", "selection", "manager graph", "dashboard info", "search"]
+        self.active_pane_index = 0
+        self.search_mode = False
+        self.selection_field_index = 0
+        self.path_popup_open = False
+        self.path_popup_index = 0
+        self.selection_popup_open = False
+        self.selection_popup_index = 0
+        self.copied_message = ''
+        self.dim_background = False
+        self.color_pairs: dict[str, int] = {}
+
+    def init_curses(self) -> None:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.stdscr.nodelay(False)
+        self.stdscr.keypad(True)
+        self.stdscr.scrollok(False)
+        self.stdscr.idlok(False)
+        self.stdscr.leaveok(True)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
+        # iTerm/xterm need mouse tracking enabled before wheel events reach curses.
+        sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")
+        sys.stdout.flush()
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, 67, -1)   # muted teal border
+        curses.init_pair(12, 117, -1) # active teal border
+        curses.init_pair(13, 37, -1)  # pill edge, darker teal
+        curses.init_pair(2, 117, -1)  # cyan
+        curses.init_pair(3, 109, -1)  # dim teal text
+        curses.init_pair(4, 236, 37)  # focused row, teal-tinted background
+        curses.init_pair(5, 214, -1)  # orange
+        curses.init_pair(6, 150, -1)  # green
+        curses.init_pair(7, 204, -1)  # pink
+        curses.init_pair(8, 81, -1)   # brew blue
+        curses.init_pair(9, 45, -1)   # teal
+        curses.init_pair(14, 24, -1)  # scrollbar track
+        curses.init_pair(15, 236, -1)  # modal backdrop text dimming
+        self.color_pairs = {
+            "border": 1,
+            "accent": 2,
+            "dim": 3,
+            "selected": 4,
+            "orange": 5,
+            "green": 6,
+            "pink": 7,
+            "brew": 8,
+            "teal": 9,
+            "active_border": 12,
+            "pill_edge": 13,
+            "scroll_track": 14,
+            "modal_backdrop": 15,
+        }
+
+    def manager_color(self, manager: str) -> int:
+        mapping = {
+            "brew": 8,
+            "npm": 5,
+            "pnpm": 5,
+            "yarn": 9,
+            "bun": 5,
+            "pipx": 2,
+            "pip3": 2,
+            "gem": 7,
+            "cargo": 5,
+            "mas": 6,
+        }
+        return mapping.get(manager, 3)
+
+    def apply_filter(self) -> None:
+        query = self.query.lower().strip()
+        if not query:
+            self.filtered = self.rows[:]
+        else:
+            self.filtered = [
+                row for row in self.rows
+                if query in row.manager.lower()
+                or query in row.ptype.lower()
+                or query in row.name.lower()
+                or query in row.version.lower()
+                or query in row.path.lower()
+                or query in row.origin.lower()
+            ]
+        if self.selected >= len(self.filtered):
+            self.selected = max(0, len(self.filtered) - 1)
+        self.ensure_visible()
+
+    def ensure_visible(self) -> None:
+        _, _, _, _, _, _, _, _, body_h, _, _ = self.layout()
+        viewport = max(1, body_h - 3)
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + viewport:
+            self.scroll = self.selected - viewport + 1
+        self.scroll = max(0, self.scroll)
+
+    def dashboard_height(self, width: int) -> int:
+        managers = len(self.manager_pairs)
+        columns = 2 if width >= 86 else 1
+        distribution_rows = (managers + columns - 1) // columns
+        return max(MIN_DASHBOARD_HEIGHT, min(10, distribution_rows + 3))
+
+    def layout(self):
+        h, w = self.stdscr.getmaxyx()
+        outer_pad = 1
+        inner_w = max(40, w - outer_pad * 2)
+        y = outer_pad
+        x = outer_pad
+        dashboard_h = self.dashboard_height(inner_w)
+        search_h = SEARCH_HEIGHT
+        body_h = max(12, h - dashboard_h - search_h - 4)
+        sidebar_w = max(MIN_SIDEBAR, int(inner_w * 0.30))
+        packages_w = inner_w - sidebar_w - 1
+        body_y = y + dashboard_h + search_h
+        selection_h = max(8, body_h // 2)
+        graph_h = body_h - selection_h
+        return (x, y, inner_w, packages_w, sidebar_w, dashboard_h, search_h, body_y, body_h, selection_h, graph_h)
+
+    def draw_box(self, y: int, x: int, h: int, w: int, title: str, active: bool = False) -> None:
+        if h < 2 or w < 2:
+            return
+        border = self.ui_attr(curses.color_pair(self.color_pairs["active_border"] if active else self.color_pairs["border"]))
+        self.stdscr.attron(border)
+        self.stdscr.addstr(y, x, "┌" + "─" * (w - 2) + "┐")
+        for row in range(1, h - 1):
+            self.stdscr.addstr(y + row, x, "│")
+            self.stdscr.addstr(y + row, x + w - 1, "│")
+        self.stdscr.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘")
+        if title and w > len(title) + 6:
+            title_x = x + 2
+            self.addn(y, title_x, title, w - 4, border, curses.A_BOLD if active else 0)
+        self.stdscr.attroff(border)
+
+    def ui_attr(self, attr: int = 0) -> int:
+        if self.dim_background:
+            return attr | curses.A_DIM
+        return attr
+
+    def addn(self, y: int, x: int, text: str, width: int, color: int = 0, attr: int = 0) -> None:
+        if width <= 0:
+            return
+        try:
+            self.stdscr.addnstr(y, x, text, width, self.ui_attr(color | attr))
+        except curses.error:
+            pass
+
+    def draw_active_pill(self, y: int, x: int) -> None:
+        label = f" {self.active_pane().title()} "
+        edge = curses.color_pair(self.color_pairs["pill_edge"])
+        body = curses.color_pair(self.color_pairs["selected"]) | curses.A_BOLD
+        self.addn(y, x, "", 1, edge)
+        self.addn(y, x + 1, label, len(label), body)
+        self.addn(y, x + 1 + len(label), "", 1, edge)
+
+    def draw_scrollbar(self, y: int, x: int, h: int, total: int, visible: int, offset: int) -> None:
+        if h <= 2 or total <= visible:
+            return
+        track_y = y + 1
+        track_h = max(1, h - 2)
+        dim = curses.color_pair(self.color_pairs["scroll_track"])
+        active = curses.color_pair(self.color_pairs["active_border"])
+        self.addn(track_y, x, "↑", 1, dim, curses.A_BOLD)
+        self.addn(y + h - 2, x, "↓", 1, dim, curses.A_BOLD)
+        inner_y = track_y + 1
+        inner_h = max(1, track_h - 2)
+        for row in range(inner_h):
+            self.addn(inner_y + row, x, "│", 1, dim)
+        thumb_h = max(1, int(inner_h * (visible / max(1, total))))
+        max_offset = max(1, total - visible)
+        thumb_y = inner_y + int((inner_h - thumb_h) * (offset / max_offset))
+        for row in range(thumb_h):
+            self.addn(thumb_y + row, x, "█", 1, active)
+
+    def active_pane(self) -> str:
+        return self.active_panes[self.active_pane_index]
+
+    def scroll_packages(self, direction: int, step: int = 1) -> None:
+        if not self.filtered:
+            return
+        self.has_interacted = True
+        self.active_pane_index = self.active_panes.index("packages")
+        if direction < 0:
+            self.selected = max(0, self.selected - step)
+        else:
+            self.selected = min(max(0, len(self.filtered) - 1), self.selected + step)
+        self.ensure_visible()
+
+    def read_mouse_escape(self) -> str:
+        chars = ""
+        self.stdscr.nodelay(True)
+        try:
+            for _ in range(32):
+                ch = self.stdscr.getch()
+                if ch == -1:
+                    break
+                chars += chr(ch) if 0 <= ch <= 255 else ""
+                if chars.endswith(("M", "m")):
+                    break
+        finally:
+            self.stdscr.nodelay(False)
+        return chars
+
+    def dashboard_lines(self) -> list[str]:
+        counts = Counter(row.manager for row in self.rows)
+        top_manager, top_count = ("-", 0)
+        if counts:
+            top_manager, top_count = counts.most_common(1)[0]
+        js_count = sum(1 for row in self.rows if row.manager in {"npm", "pnpm", "yarn", "bun"})
+        py_count = sum(1 for row in self.rows if row.manager in {"pipx", "pip3"})
+        dev_count = sum(1 for row in self.rows if row.manager in {"brew", "cargo", "gem", "mas"})
+        return [
+            f"host: {self.host}   shell: {self.shell}   time: {self.now().strftime('%H:%M:%S')}   total disk: {self.total_disk}",
+            f"Managers {len(counts)}   Packages {len(self.rows)}   Types {len(set(r.ptype for r in self.rows))}   Top {top_manager} ({top_count})",
+            f"JS {js_count}   Python {py_count}   Devtools {dev_count}",
+        ]
+
+    def draw_dashboard(self, y: int, x: int, h: int, w: int) -> None:
+        self.draw_box(y, x, h, w, "dashboard info", active=self.active_pane() == "dashboard info")
+        lines = self.dashboard_lines()
+        split_x = x + max(34, int(w * 0.58))
+        split_x = min(x + w - 24, split_x)
+        left_w = max(20, split_x - x - 4)
+        right_x = split_x + 2
+        right_w = max(12, x + w - right_x - 2)
+        for idx, line in enumerate(lines):
+            color = curses.color_pair(self.color_pairs["dim"] if idx == 0 else self.color_pairs["accent"])
+            self.addn(y + 1 + idx, x + 2, line, left_w, color, curses.A_BOLD if idx > 0 else 0)
+        bars = self.manager_pairs
+        if not bars:
+            return
+        max_count = max(count for _, count in bars)
+        self.addn(y + 1, right_x, "Distribution", right_w, curses.color_pair(self.color_pairs["accent"]), curses.A_BOLD)
+        columns = 2 if right_w >= 34 else 1
+        col_w = max(12, right_w // columns)
+        bar_room = max(1, col_w - 12)
+        max_items = max(0, (h - 3) * columns)
+        for idx, (manager, count) in enumerate(bars[:max_items]):
+            row_y = y + 2 + (idx // columns)
+            if row_y >= y + h - 1:
+                break
+            col_x = right_x + (idx % columns) * col_w
+            width = min(col_w - 1, max(1, x + w - col_x - 2))
+            bar_width = max(1, int(bar_room * (count / max_count)))
+            label = f"{manager:<5} {count:>3} "
+            self.addn(row_y, col_x, label, min(len(label), width), curses.color_pair(self.manager_color(manager)), curses.A_BOLD)
+            self.addn(row_y, col_x + len(label), "▇" * bar_width, max(0, width - len(label)), curses.color_pair(self.color_pairs["dim"]))
+
+    def draw_search(self, y: int, x: int, h: int, w: int) -> None:
+        self.draw_box(y, x, h, w, "Search", active=self.active_pane() == "search")
+        prompt = f"search > {self.query}" if self.search_mode else f"press / to search   current: {self.query}"
+        if self.active_pane() == "search":
+            self.addn(y + 1, x + 1, " " * (w - 2), w - 2, curses.color_pair(self.color_pairs["selected"]))
+            self.addn(y + 1, x + 2, prompt, w - 6, curses.color_pair(self.color_pairs["selected"]), curses.A_BOLD)
+        else:
+            self.addn(y + 1, x + 2, prompt, w - 6, curses.color_pair(self.color_pairs["teal"]), curses.A_BOLD)
+        info = f"{len(self.filtered)}/{len(self.rows)}"
+        self.addn(y + 1, x + w - len(info) - 3, info, len(info), curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+
+    def draw_packages(self, y: int, x: int, h: int, w: int) -> None:
+        self.draw_box(y, x, h, w, "Packages", active=self.active_pane() == "packages")
+        header_y = y + 1
+        self.addn(header_y, x + 2, "MANAGER", 11, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + 14, "TYPE", 10, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + 24, "PACKAGE", max(8, w - 42), curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + w - 18, "VERSION", 14, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        viewport = max(1, h - 3)
+        visible = self.filtered[self.scroll:self.scroll + viewport]
+        package_width = max(10, w - 42)
+        for idx, row in enumerate(visible):
+            real_index = self.scroll + idx
+            line_y = y + 2 + idx
+            focused = self.active_pane() == "packages" and real_index == self.selected and not (self.path_popup_open or self.selection_popup_open)
+            if focused:
+                self.addn(line_y, x + 1, " " * max(1, w - 3), max(1, w - 3), curses.color_pair(self.color_pairs["selected"]))
+            prefix = "◆ " if focused else "  "
+            if focused:
+                prefix_color = curses.color_pair(self.color_pairs["selected"])
+                manager_color = curses.color_pair(self.color_pairs["selected"])
+                type_color = curses.color_pair(self.color_pairs["selected"])
+                name_color = curses.color_pair(self.color_pairs["selected"])
+                version_color = curses.color_pair(self.color_pairs["selected"])
+                text_attr = curses.A_BOLD
+            else:
+                prefix_color = curses.color_pair(self.color_pairs["dim"])
+                manager_color = curses.color_pair(self.manager_color(row.manager))
+                type_color = curses.color_pair(self.color_pairs["dim"])
+                name_color = 0
+                version_color = 0
+                text_attr = curses.A_BOLD
+            self.addn(line_y, x + 1, prefix, 2, prefix_color, text_attr)
+            self.addn(line_y, x + 3, row.manager, 10, manager_color, text_attr)
+            self.addn(line_y, x + 15, row.ptype, 9, type_color, text_attr)
+            self.addn(line_y, x + 24, row.name, max(1, package_width - 2), name_color, text_attr)
+            self.addn(line_y, x + w - 20, row.version, 13, version_color, text_attr)
+        self.draw_scrollbar(y + 1, x + w - 3, h - 2, len(self.filtered), viewport, self.scroll)
+
+    def selected_row(self):
+        if not self.filtered:
+            return None
+        return self.filtered[self.selected]
+
+    def committed_row(self):
+        if self.committed is not None:
+            return self.committed
+        if self.filtered:
+            return self.filtered[self.selected]
+        return None
+
+    def draw_selection(self, y: int, x: int, h: int, w: int) -> None:
+        self.draw_box(y, x, h, w, "Selection", active=self.active_pane() == "selection")
+        row = self.committed_row()
+        if not row:
+            self.addn(y + 1, x + 2, "Press Enter on a package to select it", w - 4, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+            return
+        fields = self.selection_fields(row)
+        current_y = y + 1
+        for index, (label, value) in enumerate(fields):
+            if current_y >= y + h - 2:
+                break
+            focused = self.active_pane() == "selection" and index == self.selection_field_index and not (self.path_popup_open or self.selection_popup_open)
+            if focused:
+                self.addn(current_y, x + 1, " " * max(1, w - 3), max(1, w - 3), curses.color_pair(self.color_pairs["selected"]))
+            label_attr = curses.color_pair(self.color_pairs["selected"] if focused else self.color_pairs["dim"]) | curses.A_BOLD
+            value_attr = curses.color_pair(self.color_pairs["selected"] if focused else self.color_pairs["accent"] if label in {"manager", "package"} else 0) | curses.A_BOLD
+            self.addn(current_y, x + 2, f"{label:<8}: ", w - 4, label_attr)
+            self.addn(current_y, x + 12, value, max(1, w - 14), value_attr)
+            current_y += 1
+        hint_attr = curses.color_pair(self.color_pairs["dim"]) | getattr(curses, "A_ITALIC", 0)
+        prompt = "Press (Enter) to copy" if self.active_pane() == "selection" else "Press Tab to focus"
+        self.addn(y + h - 2, x + 2, prompt, min(len(prompt), w - 4), hint_attr)
+
+    def draw_manager_graph(self, y: int, x: int, h: int, w: int) -> None:
+        self.draw_box(y, x, h, w, "Manager Graph", active=self.active_pane() == "manager graph")
+        row = self.committed_row() or self.selected_row()
+        if not row:
+            self.addn(y + 1, x + 2, "No manager graph until a package is available", w - 4, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+            return
+        active = self.active_pane() == "manager graph"
+        hint_attr = curses.color_pair(self.color_pairs["dim"]) | getattr(curses, "A_ITALIC", 0)
+        prompt = "Press (Enter) to copy" if active else "Press Tab to focus"
+        lines = build_tree_lines(row.path)
+        tree_height = max(0, h - 4)
+        for idx, line in enumerate(lines[:tree_height]):
+            self.addn(y + 1 + idx, x + 2, line, w - 4, curses.color_pair(self.color_pairs["dim"] if idx == 0 else self.color_pairs["accent"]), curses.A_BOLD if idx == 0 else 0)
+        self.addn(y + h - 2, x + 2, prompt, min(len(prompt), w - 4), hint_attr)
+
+    def draw(self) -> None:
+        self.stdscr.erase()
+        self.dim_background = self.path_popup_open or self.selection_popup_open
+        h, w = self.stdscr.getmaxyx()
+        if h < 20 or w < 80:
+            self.addn(1, 2, "Window too small. Resize the terminal.", max(1, w - 4), curses.color_pair(self.color_pairs["accent"]), curses.A_BOLD)
+            self.draw_active_pill(h - 1, 2)
+            try:
+                self.stdscr.move(max(0, h - 1), 0)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            self.dim_background = False
+            return
+        x, y, inner_w, packages_w, sidebar_w, dashboard_h, search_h, body_y, body_h, selection_h, graph_h = self.layout()
+        self.draw_dashboard(y, x, dashboard_h, inner_w)
+        self.draw_search(y + dashboard_h, x, search_h, inner_w)
+        self.draw_packages(body_y, x, body_h, packages_w)
+        self.draw_selection(body_y, x + packages_w + 1, selection_h, sidebar_w)
+        self.draw_manager_graph(body_y + selection_h, x + packages_w + 1, graph_h, sidebar_w)
+        if not (self.path_popup_open or self.selection_popup_open):
+            self.draw_active_pill(h - 1, 2)
+        try:
+            self.stdscr.move(max(0, h - 1), 0)
+        except curses.error:
+            pass
+        self.stdscr.refresh()
+        self.dim_background = False
+        self.draw_path_popup()
+        self.draw_selection_popup()
+
+
+def app_handle_key(self, key: int) -> None:
+    if self.selection_popup_open:
+        row = self.committed_row() or self.selected_row()
+        items = self.selection_popup_items(row) if row else []
+        if key in (27, ord('q')):
+            self.selection_popup_open = False
+            return
+        if key in (curses.KEY_UP, ord('k')):
+            self.copied_message = ''
+            self.selection_popup_index = max(0, self.selection_popup_index - 1)
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            self.copied_message = ''
+            self.selection_popup_index = min(max(0, len(items) - 1), self.selection_popup_index + 1)
+            return
+        if key in (10, 13, curses.KEY_ENTER) and items:
+            label, value, action = items[self.selection_popup_index]
+            if action == 'exit':
+                self.selection_popup_open = False
+            elif action == 'copy_all' and row:
+                fields = self.selection_fields(row)
+                copy_to_clipboard('\n'.join(f'{field}: {data}' for field, data in fields))
+                self.copied_message = 'copied selection'
+            return
+        return
+
+    if self.path_popup_open:
+        row = self.committed_row()
+        items = self.path_popup_items(row) if row else []
+        if key in (27, ord('q')):
+            self.path_popup_open = False
+            return
+        if key in (curses.KEY_UP, ord('k')):
+            self.copied_message = ''
+            self.path_popup_index = max(0, self.path_popup_index - 1)
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            self.copied_message = ''
+            self.path_popup_index = min(max(0, len(items) - 1), self.path_popup_index + 1)
+            return
+        if key in (10, 13, curses.KEY_ENTER) and items:
+            label, value, action = items[self.path_popup_index]
+            if action == 'exit':
+                self.path_popup_open = False
+            elif action == 'open':
+                open_in_finder(value)
+                self.copied_message = 'opened finder'
+            elif action == 'copy':
+                copy_to_clipboard(value)
+                self.copied_message = f'copied {label}'
+            return
+        return
+
+    if self.search_mode:
+        if key == 27:
+            seq = self.read_mouse_escape()
+            if seq.startswith("[<64"):
+                self.scroll_packages(-1)
+                return
+            if seq.startswith("[<65"):
+                self.scroll_packages(1)
+                return
+            self.search_mode = False
+            return
+        if key in (10, 13, curses.KEY_ENTER):
+            self.search_mode = False
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.query:
+                self.query = self.query[:-1]
+                self.apply_filter()
+            return
+        if key == curses.KEY_RESIZE:
+            self.ensure_visible()
+            return
+        if key == curses.KEY_MOUSE:
+            try:
+                _, mouse_x, mouse_y, _, bstate = curses.getmouse()
+            except curses.error:
+                return
+            wheel_up = bstate & getattr(curses, "BUTTON4_PRESSED", 0)
+            wheel_down = bstate & getattr(curses, "BUTTON5_PRESSED", 0)
+            if wheel_up or wheel_down:
+                self.scroll_packages(-1 if wheel_up else 1, 1)
+            return
+        if 32 <= key <= 126:
+            self.query += chr(key)
+            self.apply_filter()
+            return
+        return
+
+    if key == 27:
+        seq = self.read_mouse_escape()
+        if seq.startswith("[<64"):
+            self.scroll_packages(-1)
+            return
+        if seq.startswith("[<65"):
+            self.scroll_packages(1)
+            return
+        return
+    if key == curses.KEY_RESIZE:
+        self.ensure_visible()
+        return
+    if key == curses.KEY_MOUSE:
+        try:
+            _, mouse_x, mouse_y, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        wheel_up = bstate & getattr(curses, "BUTTON4_PRESSED", 0)
+        wheel_down = bstate & getattr(curses, "BUTTON5_PRESSED", 0)
+        if wheel_up or wheel_down:
+            self.scroll_packages(-1 if wheel_up else 1, 1)
+        return
+    if key == 9:
+        self.active_pane_index = (self.active_pane_index + 1) % len(self.active_panes)
+        return
+    if key == ord('/'):
+        self.active_pane_index = self.active_panes.index('search')
+        self.search_mode = True
+        return
+    if key == ord('q'):
+        self.running = False
+        return
+
+    active = self.active_pane()
+    if active == 'packages':
+        if key in (curses.KEY_UP, ord('k')):
+            self.has_interacted = True
+            if self.selected > 0:
+                self.selected -= 1
+                self.ensure_visible()
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            self.has_interacted = True
+            if self.selected < len(self.filtered) - 1:
+                self.selected += 1
+                self.ensure_visible()
+            return
+        if key == curses.KEY_NPAGE:
+            self.has_interacted = True
+            self.selected = min(len(self.filtered) - 1, self.selected + 10)
+            self.ensure_visible()
+            return
+        if key == curses.KEY_PPAGE:
+            self.has_interacted = True
+            self.selected = max(0, self.selected - 10)
+            self.ensure_visible()
+            return
+        if key in (10, 13, curses.KEY_ENTER):
+            row = self.selected_row()
+            if row:
+                self.has_interacted = True
+                self.committed = row
+                self.selection_field_index = 0
+                self.selection_popup_open = True
+                self.selection_popup_index = 0
+                self.copied_message = ''
+            return
+
+    if active == 'selection':
+        row = self.committed_row()
+        if not row:
+            return
+        fields = self.selection_fields(row)
+        if key in (curses.KEY_UP, ord('k')):
+            self.selection_field_index = max(0, self.selection_field_index - 1)
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            self.selection_field_index = min(max(0, len(fields) - 1), self.selection_field_index + 1)
+            return
+        if key in (10, 13, curses.KEY_ENTER) and fields:
+            self.selection_popup_open = True
+            self.selection_popup_index = 0
+            self.copied_message = ''
+            return
+
+    if active == 'manager graph':
+        if key in (10, 13, curses.KEY_ENTER) and (self.committed_row() or self.selected_row()):
+            if self.committed is None:
+                self.committed = self.selected_row()
+                self.has_interacted = True
+            self.path_popup_open = True
+            self.path_popup_index = 0
+            self.copied_message = ''
+            return
+
+
+def app_selection_fields(self, row: PackageRow) -> list[tuple[str, str]]:
+    return [
+        ('manager', row.manager),
+        ('type', row.ptype),
+        ('package', row.name),
+        ('version', row.version),
+        ('path', row.path),
+        ('size', row.size),
+        ('origin', row.origin),
+    ]
+
+
+def app_path_popup_items(self, row: PackageRow | None = None) -> list[tuple[str, str, str]]:
+    row = row or self.committed_row() or self.selected_row()
+    path = row.path if row else ''
+    items = [(label, value, 'copy') for label, value in path_formats(path)]
+    items.append(('open in finder', path, 'open'))
+    items.append(('exit', '', 'exit'))
+    return items
+
+
+def app_selection_popup_items(self, row: PackageRow | None = None) -> list[tuple[str, str, str]]:
+    if not row:
+        return []
+    items = [(label, value, 'copy_all') for label, value in self.selection_fields(row)]
+    items.append(('copy all', '', 'copy_all'))
+    items.append(('exit', '', 'exit'))
+    return items
+
+
+def app_draw_path_popup(self) -> None:
+    if not self.path_popup_open:
+        return
+    row = self.committed_row()
+    items = self.path_popup_items(row)
+    h, w = self.stdscr.getmaxyx()
+    box_h = min(12, max(8, h - 4))
+    box_w = min(64, max(36, w // 3))
+    y = max(1, (h - box_h) // 2)
+    x = max(1, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y, x)
+    win.erase()
+    try:
+        win.bkgd(' ', 0)
+    except curses.error:
+        pass
+    try:
+        win.attron(curses.color_pair(self.color_pairs['border']))
+        win.box()
+        win.attroff(curses.color_pair(self.color_pairs['border']))
+    except curses.error:
+        win.box()
+    try:
+        win.addnstr(0, 2, ' path ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
+    except curses.error:
+        pass
+    for idx, (label, value, action) in enumerate(items[: box_h - 3]):
+        line_y = 2 + idx
+        focused = idx == self.path_popup_index
+        attr = curses.color_pair(self.color_pairs['selected'] if focused else self.color_pairs['dim']) | curses.A_BOLD
+        marker = '◆' if focused else ' '
+        display = f'{marker} {label:<14} {value}'
+        try:
+            win.addnstr(line_y, 2, display, box_w - 4, attr)
+        except curses.error:
+            pass
+    footer = self.copied_message or 'Enter copies path  ·  q exits'
+    footer_attr = curses.color_pair(self.color_pairs['green'] if self.copied_message else self.color_pairs['dim']) | getattr(curses, 'A_ITALIC', 0)
+    try:
+        win.addnstr(box_h - 2, 2, footer, box_w - 4, footer_attr)
+    except curses.error:
+        pass
+    win.refresh()
+
+
+def app_draw_selection_popup(self) -> None:
+    if not self.selection_popup_open:
+        return
+    row = self.committed_row() or self.selected_row()
+    items = self.selection_popup_items(row)
+    h, w = self.stdscr.getmaxyx()
+    box_h = min(14, max(9, h - 4))
+    box_w = min(76, max(44, w // 2))
+    y = max(1, (h - box_h) // 2)
+    x = max(1, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y, x)
+    win.erase()
+    try:
+        win.bkgd(' ', 0)
+    except curses.error:
+        pass
+    try:
+        win.attron(curses.color_pair(self.color_pairs['border']))
+        win.box()
+        win.attroff(curses.color_pair(self.color_pairs['border']))
+    except curses.error:
+        win.box()
+    try:
+        win.addnstr(0, 2, ' selection ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
+    except curses.error:
+        pass
+    for idx, (label, value, action) in enumerate(items[: box_h - 4]):
+        line_y = 2 + idx
+        focused = idx == self.selection_popup_index
+        attr = curses.color_pair(self.color_pairs['selected'] if focused else self.color_pairs['dim']) | curses.A_BOLD
+        marker = '◆' if focused else ' '
+        if action == 'exit' or label == 'copy all':
+            display = f'{marker} {label}'
+        else:
+            display = f'{marker} {label:<8}: {value}'
+        try:
+            win.addnstr(line_y, 2, display, box_w - 4, attr)
+        except curses.error:
+            pass
+    footer = self.copied_message or 'Enter copies all info  ·  q exits'
+    footer_attr = curses.color_pair(self.color_pairs['green'] if self.copied_message else self.color_pairs['dim']) | getattr(curses, 'A_ITALIC', 0)
+    try:
+        win.addnstr(box_h - 2, 2, footer, box_w - 4, footer_attr)
+    except curses.error:
+        pass
+    win.refresh()
+
+
+def app_run(self) -> None:
+    self.init_curses()
+    self.apply_filter()
+    while self.running:
+        self.draw()
+        key = self.stdscr.getch()
+        self.handle_key(key)
+
+
+App.handle_key = app_handle_key
+App.selection_fields = app_selection_fields
+App.path_popup_items = app_path_popup_items
+App.selection_popup_items = app_selection_popup_items
+App.draw_path_popup = app_draw_path_popup
+App.draw_selection_popup = app_draw_selection_popup
+App.run = app_run
+
+def curses_main(stdscr, rows: list[PackageRow]) -> None:
+    App(stdscr, rows).run()
+
+
+def main() -> int:
+    rows = collect_with_loader()
+    sys.stdout.write("\033[?1049h\033[2J\033[H")
+    sys.stdout.flush()
+    try:
+        curses.wrapper(curses_main, rows)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        sys.stdout.write("\033[?1049l")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
