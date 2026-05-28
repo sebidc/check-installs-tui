@@ -28,6 +28,24 @@ SEARCH_HEIGHT = 3
 MIN_DASHBOARD_HEIGHT = 6
 MIN_SIDEBAR = 28
 BG_HEX = 0x1F, 0x1E, 0x2E
+ICONS = {
+    "app": "\uf013",
+    "apple": "\uf179",
+    "box": "\uf487",
+    "brew": "\uf0fc",
+    "bun": "\ue76f",
+    "cargo": "\ue7a8",
+    "copy": "\uf0c5",
+    "folder": "\uf07b",
+    "gem": "\ue739",
+    "graph": "\uf080",
+    "npm": "\ue71e",
+    "package": "\uf1b2",
+    "pip": "\ue73c",
+    "search": "\uf002",
+    "terminal": "\uf120",
+    "yarn": "\ue6a7",
+}
 
 
 @dataclass
@@ -331,10 +349,10 @@ def render_loader(done_flag: dict, holder: dict) -> list[PackageRow]:
                 color = 45 if i < 2 else 117 if i < 4 else 109
                 x = max(1, (cols - len(line)) // 2)
                 sys.stdout.write(f"{ansi_at(top + i, x)}\033[38;5;{color}m{line}\033[0m")
-            title = "check installs"
+            title = f"{ICONS['package']} check installs"
             tx = max(1, (cols - len(title)) // 2)
             sys.stdout.write(f"{ansi_at(top + 7, tx)}\033[38;5;109m{title}\033[0m")
-            label_base = loading_label(current)
+            label_base = f"{ICONS['terminal']} {loading_label(current)}"
             dot_cycle = ("   ", ".  ", ".. ", "...")
             label = f"{label_base}{dot_cycle[(tick // 6) % len(dot_cycle)]}"
             lx = max(1, (cols - len(label_base) - 3) // 2)
@@ -563,6 +581,21 @@ class App:
         }
         return mapping.get(manager, 3)
 
+    def manager_icon(self, manager: str) -> str:
+        mapping = {
+            "brew": ICONS["brew"],
+            "npm": ICONS["npm"],
+            "pnpm": ICONS["npm"],
+            "yarn": ICONS["yarn"],
+            "bun": ICONS["bun"],
+            "pipx": ICONS["pip"],
+            "pip3": ICONS["pip"],
+            "gem": ICONS["gem"],
+            "cargo": ICONS["cargo"],
+            "mas": ICONS["apple"],
+        }
+        return mapping.get(manager, ICONS["package"])
+
     def apply_filter(self) -> None:
         query = self.query.lower().strip()
         if not query:
@@ -705,9 +738,9 @@ class App:
         py_count = sum(1 for row in self.rows if row.manager in {"pipx", "pip3"})
         dev_count = sum(1 for row in self.rows if row.manager in {"brew", "cargo", "gem", "mas"})
         return [
-            f"host: {self.host}   shell: {self.shell}   time: {self.now().strftime('%H:%M:%S')}   total disk: {self.total_disk}",
-            f"Managers {len(counts)}   Packages {len(self.rows)}   Types {len(set(r.ptype for r in self.rows))}   Top {top_manager} ({top_count})",
-            f"JS {js_count}   Python {py_count}   Devtools {dev_count}",
+            f"{ICONS['terminal']} {self.host}   shell: {self.shell}   time: {self.now().strftime('%H:%M:%S')}   disk: {self.total_disk}",
+            f"{ICONS['box']} Managers {len(counts)}   Packages {len(self.rows)}   Types {len(set(r.ptype for r in self.rows))}   Top {self.manager_icon(top_manager)} {top_manager} ({top_count})",
+            f"{ICONS['npm']} JS {js_count}   {ICONS['pip']} Python {py_count}   {ICONS['app']} Devtools {dev_count}",
         ]
 
     def draw_dashboard(self, y: int, x: int, h: int, w: int) -> None:
@@ -725,7 +758,7 @@ class App:
         if not bars:
             return
         max_count = max(count for _, count in bars)
-        self.addn(y + 1, right_x, "Distribution", right_w, curses.color_pair(self.color_pairs["accent"]), curses.A_BOLD)
+        self.addn(y + 1, right_x, f"{ICONS['graph']} Distribution", right_w, curses.color_pair(self.color_pairs["accent"]), curses.A_BOLD)
         columns = 2 if right_w >= 34 else 1
         col_w = max(12, right_w // columns)
         bar_room = max(1, col_w - 12)
@@ -737,13 +770,13 @@ class App:
             col_x = right_x + (idx % columns) * col_w
             width = min(col_w - 1, max(1, x + w - col_x - 2))
             bar_width = max(1, int(bar_room * (count / max_count)))
-            label = f"{manager:<5} {count:>3} "
+            label = f"{self.manager_icon(manager)} {manager:<5} {count:>3} "
             self.addn(row_y, col_x, label, min(len(label), width), curses.color_pair(self.manager_color(manager)), curses.A_BOLD)
             self.addn(row_y, col_x + len(label), "▇" * bar_width, max(0, width - len(label)), curses.color_pair(self.color_pairs["dim"]))
 
     def draw_search(self, y: int, x: int, h: int, w: int) -> None:
         self.draw_box(y, x, h, w, "Search", active=self.active_pane() == "search")
-        prompt = f"search > {self.query}" if self.search_mode else f"press / to search   current: {self.query}"
+        prompt = f"{ICONS['search']} search > {self.query}" if self.search_mode else f"{ICONS['search']} press / to search   current: {self.query}"
         if self.active_pane() == "search":
             self.addn(y + 1, x + 1, " " * (w - 2), w - 2, curses.color_pair(self.color_pairs["selected"]))
             self.addn(y + 1, x + 2, prompt, w - 6, curses.color_pair(self.color_pairs["selected"]), curses.A_BOLD)
@@ -755,13 +788,13 @@ class App:
     def draw_packages(self, y: int, x: int, h: int, w: int) -> None:
         self.draw_box(y, x, h, w, "Packages", active=self.active_pane() == "packages")
         header_y = y + 1
-        self.addn(header_y, x + 2, "MANAGER", 11, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
-        self.addn(header_y, x + 14, "TYPE", 10, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
-        self.addn(header_y, x + 24, "PACKAGE", max(8, w - 42), curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + 2, "MANAGER", 12, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + 16, "TYPE", 10, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
+        self.addn(header_y, x + 25, "PACKAGE", max(8, w - 43), curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
         self.addn(header_y, x + w - 18, "VERSION", 14, curses.color_pair(self.color_pairs["dim"]), curses.A_BOLD)
         viewport = max(1, h - 3)
         visible = self.filtered[self.scroll:self.scroll + viewport]
-        package_width = max(10, w - 42)
+        package_width = max(10, w - 43)
         for idx, row in enumerate(visible):
             real_index = self.scroll + idx
             line_y = y + 2 + idx
@@ -784,9 +817,10 @@ class App:
                 version_color = 0
                 text_attr = curses.A_BOLD
             self.addn(line_y, x + 1, prefix, 2, prefix_color, text_attr)
-            self.addn(line_y, x + 3, row.manager, 10, manager_color, text_attr)
-            self.addn(line_y, x + 15, row.ptype, 9, type_color, text_attr)
-            self.addn(line_y, x + 24, row.name, max(1, package_width - 2), name_color, text_attr)
+            self.addn(line_y, x + 3, self.manager_icon(row.manager), 2, manager_color, text_attr)
+            self.addn(line_y, x + 6, row.manager, 9, manager_color, text_attr)
+            self.addn(line_y, x + 16, row.ptype, 8, type_color, text_attr)
+            self.addn(line_y, x + 25, row.name, max(1, package_width - 2), name_color, text_attr)
             self.addn(line_y, x + w - 20, row.version, 13, version_color, text_attr)
         self.draw_scrollbar(y + 1, x + w - 3, h - 2, len(self.filtered), viewport, self.scroll)
 
@@ -1061,13 +1095,13 @@ def app_handle_key(self, key: int) -> None:
 
 def app_selection_fields(self, row: PackageRow) -> list[tuple[str, str]]:
     return [
-        ('manager', row.manager),
-        ('type', row.ptype),
-        ('package', row.name),
-        ('version', row.version),
-        ('path', row.path),
-        ('size', row.size),
-        ('origin', row.origin),
+        (f'{ICONS["package"]} manager', row.manager),
+        (f'{ICONS["box"]} type', row.ptype),
+        (f'{ICONS["package"]} package', row.name),
+        (f'{ICONS["app"]} version', row.version),
+        (f'{ICONS["folder"]} path', row.path),
+        (f'{ICONS["graph"]} size', row.size),
+        (f'{ICONS["terminal"]} origin', row.origin),
     ]
 
 
@@ -1075,7 +1109,7 @@ def app_path_popup_items(self, row: PackageRow | None = None) -> list[tuple[str,
     row = row or self.committed_row() or self.selected_row()
     path = row.path if row else ''
     items = [(label, value, 'copy') for label, value in path_formats(path)]
-    items.append(('open in finder', path, 'open'))
+    items.append((f'{ICONS["folder"]} open in finder', path, 'open'))
     items.append(('exit', '', 'exit'))
     return items
 
@@ -1084,7 +1118,7 @@ def app_selection_popup_items(self, row: PackageRow | None = None) -> list[tuple
     if not row:
         return []
     items = [(label, value, 'copy_all') for label, value in self.selection_fields(row)]
-    items.append(('copy all', '', 'copy_all'))
+    items.append((f'{ICONS["copy"]} copy all', '', 'copy_all'))
     items.append(('exit', '', 'exit'))
     return items
 
@@ -1112,20 +1146,20 @@ def app_draw_path_popup(self) -> None:
     except curses.error:
         win.box()
     try:
-        win.addnstr(0, 2, ' path ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
+        win.addnstr(0, 2, f' {ICONS["folder"]} path ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
     except curses.error:
         pass
     for idx, (label, value, action) in enumerate(items[: box_h - 3]):
         line_y = 2 + idx
         focused = idx == self.path_popup_index
         attr = curses.color_pair(self.color_pairs['selected'] if focused else self.color_pairs['dim']) | curses.A_BOLD
-        marker = '◆' if focused else ' '
+        marker = '' if focused else ' '
         display = f'{marker} {label:<14} {value}'
         try:
             win.addnstr(line_y, 2, display, box_w - 4, attr)
         except curses.error:
             pass
-    footer = self.copied_message or 'Enter copies path  ·  q exits'
+    footer = self.copied_message or f'{ICONS["copy"]} Enter copies path  ·  q exits'
     footer_attr = curses.color_pair(self.color_pairs['green'] if self.copied_message else self.color_pairs['dim']) | getattr(curses, 'A_ITALIC', 0)
     try:
         win.addnstr(box_h - 2, 2, footer, box_w - 4, footer_attr)
@@ -1157,15 +1191,15 @@ def app_draw_selection_popup(self) -> None:
     except curses.error:
         win.box()
     try:
-        win.addnstr(0, 2, ' selection ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
+        win.addnstr(0, 2, f' {ICONS["package"]} selection ', box_w - 4, curses.color_pair(self.color_pairs['dim']) | curses.A_BOLD)
     except curses.error:
         pass
     for idx, (label, value, action) in enumerate(items[: box_h - 4]):
         line_y = 2 + idx
         focused = idx == self.selection_popup_index
         attr = curses.color_pair(self.color_pairs['selected'] if focused else self.color_pairs['dim']) | curses.A_BOLD
-        marker = '◆' if focused else ' '
-        if action == 'exit' or label == 'copy all':
+        marker = '' if focused else ' '
+        if action == 'exit' or label.endswith('copy all'):
             display = f'{marker} {label}'
         else:
             display = f'{marker} {label:<8}: {value}'
@@ -1173,7 +1207,7 @@ def app_draw_selection_popup(self) -> None:
             win.addnstr(line_y, 2, display, box_w - 4, attr)
         except curses.error:
             pass
-    footer = self.copied_message or 'Enter copies all info  ·  q exits'
+    footer = self.copied_message or f'{ICONS["copy"]} Enter copies all info  ·  q exits'
     footer_attr = curses.color_pair(self.color_pairs['green'] if self.copied_message else self.color_pairs['dim']) | getattr(curses, 'A_ITALIC', 0)
     try:
         win.addnstr(box_h - 2, 2, footer, box_w - 4, footer_attr)

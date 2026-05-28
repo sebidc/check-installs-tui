@@ -20,6 +20,7 @@ This release promotes the newer dashboard experience that was added after the ea
 - Selection popup with copy actions for package fields.
 - Path popup with copy/open/reveal actions for installed package locations.
 - Homebrew installs a short `ci` command alongside `check-installs-tui`.
+- Nerd Font icons are used throughout the TUI when your terminal font supports them.
 
 ## Supported Managers
 
@@ -37,6 +38,8 @@ This release promotes the newer dashboard experience that was added after the ea
 - `mas`
 
 Missing managers are skipped automatically.
+
+For the best visual experience, use a Nerd Font in your terminal.
 
 ## Install
 
